@@ -2,7 +2,8 @@
 
 基于 FastAPI + SQLite 的退役电芯成组放行服务：录入待选电芯（最多 12 节），按串联成组
 约束预选最优组合，确认时在单个 SQLite 事务中原子占用整组并保存不可改写的检测快照；
-已确认组可登记为 2~4 组的可追溯交付批次，批次按当前隔离记录判定整批是否可交付。
+已确认组可登记为 2~4 组的可追溯交付批次，批次按当前隔离记录判定整批是否可交付；
+实际发运时按批次号确认发运一次，写入不可改写的发运时间与批次关联。
 
 ## 快速启动
 
@@ -62,6 +63,19 @@ python -m pytest tests/ -q
   （`deliverable: false`），但不改写成员关系与原快照。建批与隔离走同一写路径，
   并发时以**提交先后**决定是拒绝建批（隔离先提交）还是让已建批次转为阻断
   （建批先提交）；批次查询在同一已提交快照内完成，不会拼出跨快照状态。
+- **批次发运**：`POST /batches/{batch_id}/ship` 在实际发运时按批次号**确认发运一次**。
+  在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查三个条件：批次**存在**、**尚未发运**、
+  且全部成员组**当前没有任何电芯被隔离**；任一不满足即整事务**回滚，不留下发运记录**
+  （批次不存在 `404`；已发运或成员被隔离 `409`）。成功后向不可改写的 `shipments` 表
+  （触发器禁止 UPDATE/DELETE、`batch_id` 主键保证一批一条）写入发运时间与批次关联，
+  返回批次号、成员组号与各组**原检测快照**。发运与隔离交错时按**提交先后**处理：
+  隔离先提交则拒绝发运；发运先提交则发运记录保留，此后的隔离会让已发运批次显示
+  **需追溯**（`needs_trace: true`）及受影响的组号、电芯 ID 和原因（`blocked_groups`），
+  发运时间与成员关系不改写。**重复发运明确拒绝**（`409`，发运时间保持首次值）；
+  未发运批次继续按原规则查询。`GET /batches` / `GET /batches/{batch_id}` 的单次响应
+  同时呈现**历史发运事实**（`shipped` / `shipped_at`，只由发运提交产生）与**当前隔离
+  状态**（`deliverable` / `blocked_groups` / `needs_trace`，按当前隔离记录计算），
+  二者来自同一已提交快照，必然自洽。
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
   看到**已提交的完整快照**。确认/隔离事务提交前，其他请求看不到其中间状态；提交
   成功的瞬间整组（组记录 + 快照 + 占用）或隔离记录一次性可见，回滚则毫无痕迹。
@@ -89,7 +103,8 @@ python -m pytest tests/ -q
 | POST | `/groups/confirm` | 确认候选（单事务重查版本/占用/隔离，原子占用 + 快照） |
 | GET | `/groups` / `/groups/{group_id}` | 查询已确认组：检测快照 + 当前阻断状态 |
 | POST | `/batches` | 登记交付批次（2~4 个不重复组号；单事务重查，独占归属） |
-| GET | `/batches` / `/batches/{batch_id}` | 查询批次：固定成员 + 各组检测快照 + 整批可交付状态 |
+| POST | `/batches/{batch_id}/ship` | 确认发运一次（单事务重查存在/未发运/全员未隔离，写不可改写发运记录） |
+| GET | `/batches` / `/batches/{batch_id}` | 查询批次：固定成员 + 各组检测快照 + 历史发运事实 + 当前隔离状态 |
 
 ## 调用示例（curl）
 
@@ -330,7 +345,8 @@ curl -s -X POST http://localhost:8000/batches \
   -d '{"group_ids":[1,2]}'
 ```
 
-成功返回 `201`：批次号、固定成员关系、各组确认时的检测快照与整批可交付状态：
+成功返回 `201`：批次号、固定成员关系、各组确认时的检测快照、历史发运事实与整批
+可交付状态：
 
 ```json
 {
@@ -338,7 +354,10 @@ curl -s -X POST http://localhost:8000/batches \
   "chemistry": "LFP",
   "created_at": "2026-10-06T03:00:00.000000+00:00",
   "group_ids": [1, 2],
+  "shipped": false,
+  "shipped_at": null,
   "deliverable": true,
+  "needs_trace": false,
   "blocked_groups": [],
   "groups": [
     {"group_id": 1, "blocked": false, "blocked_cells": [],
@@ -370,7 +389,10 @@ curl -s http://localhost:8000/batches/1
 {
   "batch_id": 1,
   "group_ids": [1, 2],
+  "shipped": false,
+  "shipped_at": null,
   "deliverable": false,
+  "needs_trace": false,
   "blocked_groups": [
     {"group_id": 2, "cell_id": "C005", "reason": "巡检发现鼓包",
      "isolated_at": "2026-10-06T03:30:00.000000+00:00"}
@@ -382,13 +404,85 @@ curl -s http://localhost:8000/batches/1
 建批与隔离并发时同样以**提交先后**决定结果：隔离先提交则建批整批拒绝（`409`，
 无批次、无部分归属）；建批先提交则批次产生并随即显示 `deliverable: false`。
 任何一次批次查询（`GET /batches` / `GET /batches/{batch_id}`）都在同一已提交
-快照内完成，`deliverable`、`blocked_groups` 与各组的 `blocked` 标记必然自洽。
+快照内完成，`shipped`/`shipped_at`（历史发运事实）与 `deliverable`、
+`blocked_groups`、`needs_trace`（当前隔离状态）必然自洽。
+
+### 11. 批次发运确认（实际发运时按批次号一次）
+
+```bash
+# 批次 1 已登记、尚未发运、全部成员当前未被隔离 -> 201 写入不可改写的发运记录
+curl -s -X POST http://localhost:8000/batches/1/ship
+```
+
+响应返回批次号、成员组号与各组原检测快照，并带上不可改写的发运时间：
+
+```json
+{
+  "batch_id": 1,
+  "chemistry": "LFP",
+  "created_at": "2026-10-06T03:00:00.000000+00:00",
+  "group_ids": [1, 2],
+  "shipped": true,
+  "shipped_at": "2026-10-06T04:00:00.000000+00:00",
+  "deliverable": true,
+  "needs_trace": false,
+  "blocked_groups": [],
+  "groups": ["...各组确认时的原检测快照，与 GET /groups/{group_id} 一致..."]
+}
+```
+
+拒绝发运的情形（整事务回滚，**不留下发运记录**）：
+
+```bash
+# 批次不存在 -> 404
+curl -s -X POST http://localhost:8000/batches/999/ship
+# {"detail":"批次 999 不存在"}
+
+# 发运前成员电芯已被隔离 -> 409（给出受影响的成员组号）
+curl -s -X POST http://localhost:8000/cells/C005/isolate \
+  -H 'Content-Type: application/json' -d '{"reason":"发运前检出漏液"}'
+curl -s -X POST http://localhost:8000/batches/1/ship
+# {"detail":"批次成员当前被安全隔离，拒绝发运（未写发运记录）：[2]"}
+# 此时 GET /batches/1 仍是 shipped=false、shipped_at=null
+
+# 重复发运 -> 409 明确拒绝，发运时间保持首次值不改写
+curl -s -X POST http://localhost:8000/batches/1/ship
+# {"detail":"批次 1 已发运，不能重复发运"}
+```
+
+发运**先提交**之后成员再被隔离：发运记录保留，批次转为**需追溯**，历史发运时间
+与成员关系不改写：
+
+```bash
+curl -s -X POST http://localhost:8000/cells/C005/isolate \
+  -H 'Content-Type: application/json' -d '{"reason":"发运后巡检发现鼓包"}'
+curl -s http://localhost:8000/batches/1
+```
+
+```json
+{
+  "batch_id": 1,
+  "group_ids": [1, 2],
+  "shipped": true,
+  "shipped_at": "2026-10-06T04:00:00.000000+00:00",
+  "deliverable": false,
+  "needs_trace": true,
+  "blocked_groups": [
+    {"group_id": 2, "cell_id": "C005", "reason": "发运后巡检发现鼓包",
+     "isolated_at": "2026-10-06T04:30:00.000000+00:00"}
+  ],
+  "groups": ["...成员关系与各组原检测快照保持不变..."]
+}
+```
+
+发运与隔离并发时以**提交先后**处理：隔离先提交则发运被拒（`409`，无发运记录，
+批次维持未发运）；发运先提交则记录保留、随后查询显示 `needs_trace: true`。
 
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询 / 批次登记与查询
+  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询 / 批次登记、发运与查询
   db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
   schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离原因、批次 2~4 组等校验）

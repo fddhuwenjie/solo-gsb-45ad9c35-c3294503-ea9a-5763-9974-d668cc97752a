@@ -25,6 +25,15 @@ occupied=false 同时 isolated=true。
 和原因。后续隔离会阻断已建批次，但不改写成员关系与原快照。建批与隔离走同一写路径
 （写锁 + BEGIN IMMEDIATE），并发时以提交先后决定是拒绝建批还是让已建批次转为
 阻断；批次查询在同一已提交快照内完成，不跨快照拼装。
+
+批次发运：实际发运时按批次号确认发运一次。发运在同一写事务内重查批次存在、尚未
+发运且全部成员当前未被隔离，任一不满足即拒绝并回滚，不留下发运记录；成功后写入
+不可改写的发运时间与批次关联，返回批次号、成员组号与各组原检测快照。发运与隔离
+交错时以提交先后处理：隔离先提交则拒绝发运；发运先提交则发运记录保留，此后的隔离
+会让已发运批次显示需追溯（needs_trace=true）及受影响的组号、电芯 ID 和原因。
+重复发运明确拒绝（409），未发运批次继续按原规则查询。批次列表与按号查询在同一已
+提交快照内同时呈现历史发运事实（shipped/shipped_at，只由发运提交产生）与当前隔离
+状态（deliverable/blocked_groups/needs_trace，按当前隔离记录计算）。
 """
 from datetime import datetime, timezone
 
@@ -38,7 +47,7 @@ from .schemas import (
 )
 from .selection import choose_group
 
-app = FastAPI(title="退役电芯成组放行 API", version="1.2.0")
+app = FastAPI(title="退役电芯成组放行 API", version="1.3.0")
 
 
 # 一次取出电芯档案与隔离标志：LEFT JOIN 单条语句天然共享同一读快照，
@@ -504,6 +513,11 @@ def _batch_payload(conn, batch_id: int) -> dict:
         (batch_id,),
     ).fetchall()
     group_ids = [r["group_id"] for r in member_rows]
+    # 历史发运事实：发运提交后才有，一行不可改写；与下面的隔离汇总处于同一读快照
+    ship = conn.execute(
+        "SELECT shipped_at FROM shipments WHERE batch_id = ?", (batch_id,)).fetchone()
+    shipped = ship is not None
+    shipped_at = ship["shipped_at"] if ship is not None else None
     # 各组确认时的检测快照（含各组自身的当前阻断状态），成员关系固定不改写
     groups = [_group_payload(conn, gid) for gid in group_ids]
     # 受影响追溯：按当前隔离记录汇总整批阻断情况（不影响成员关系与原快照）
@@ -516,27 +530,34 @@ def _batch_payload(conn, batch_id: int) -> dict:
         " ORDER BY gc.group_id, i.cell_id",
         (batch_id,),
     ).fetchall()
+    blocked_groups = [
+        {"group_id": r["group_id"], "cell_id": r["cell_id"],
+         "reason": r["reason"], "isolated_at": r["created_at"]}
+        for r in blocked_rows
+    ]
     return {
         "batch_id": b["batch_id"],
         "chemistry": b["chemistry"],
         "created_at": b["created_at"],
         "group_ids": group_ids,  # 建批时登记的成员关系，之后固定不变
-        "deliverable": len(blocked_rows) == 0,  # False=整批阻断不可交付
-        "blocked_groups": [
-            {"group_id": r["group_id"], "cell_id": r["cell_id"],
-             "reason": r["reason"], "isolated_at": r["created_at"]}
-            for r in blocked_rows
-        ],
+        # 历史发运事实：只由发运事务提交产生，此后隔离不改写
+        "shipped": shipped,
+        "shipped_at": shipped_at,
+        "deliverable": len(blocked_rows) == 0,  # False=当前被隔离阻断不可交付
+        # 需追溯：已发运且发运后（按当前隔离记录）有成员电芯被隔离
+        "needs_trace": shipped and len(blocked_rows) > 0,
+        "blocked_groups": blocked_groups,
         "groups": groups,
     }
 
 
 @app.get("/batches")
 def list_batches():
-    """批次列表：同一已提交快照内的完整批次（建批事务未提交的批次不可见）。
+    """批次列表：同一已提交快照内的完整批次（建批/发运事务未提交的内容不可见）。
 
     每批附带固定成员关系、各组确认时的检测快照，以及按当前隔离记录判定的
-    整批可交付状态与受影响的组号、电芯 ID 和原因。
+    整批可交付状态与受影响的组号、电芯 ID 和原因；历史发运事实
+    （shipped/shipped_at）与需追溯标志（needs_trace）同样取自该快照。
     """
     conn = db.get_conn()
     with db.read_snapshot(conn):
@@ -547,12 +568,69 @@ def list_batches():
 
 @app.get("/batches/{batch_id}")
 def get_batch(batch_id: int):
-    """按批次号查询：固定成员关系、各组确认时的检测快照、按当前隔离记录判定的
-    整批可交付状态（未提交或已回滚的批次不可见；单次查询只反映同一已提交状态）。"""
+    """按批次号查询：固定成员关系、各组确认时的检测快照、历史发运事实与按当前
+    隔离记录判定的整批可交付/需追溯状态（未提交或已回滚的内容不可见；单次查询
+    只反映同一已提交状态）。"""
     conn = db.get_conn()
     with db.read_snapshot(conn):
         b = conn.execute(
             "SELECT 1 FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
         if b is None:
             raise HTTPException(404, f"批次 {batch_id} 不存在")
+        return _batch_payload(conn, batch_id)
+
+
+# ---------- 批次发运 ----------
+
+@app.post("/batches/{batch_id}/ship", status_code=201)
+def ship_batch(batch_id: int):
+    """实际发运时按批次号确认发运一次。
+
+    在同一写事务（BEGIN IMMEDIATE）内重查：批次存在、尚未发运、且全部成员组
+    当前没有任何电芯被隔离。任一条件不满足即整事务回滚——不产生发运记录。
+    成功后写入不可改写的发运时间与批次关联，返回批次号、成员组号与各组原检测
+    快照（查询口径与 GET /batches/{batch_id} 一致）。
+
+    发运与隔离交错时以提交先后处理：隔离先提交则此处重查命中、拒绝发运；
+    发运先提交则发运记录保留，此后的隔离只改变查询到的当前隔离状态，让已发运
+    批次显示 needs_trace=true 及受影响的组号、电芯 ID 和原因。重复发运明确
+    拒绝（409），未发运批次继续按原规则查询。
+    """
+    conn = db.get_conn()
+    with db.write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            b = conn.execute(
+                "SELECT 1 FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            if b is None:
+                raise HTTPException(404, f"批次 {batch_id} 不存在")
+            ship = conn.execute(
+                "SELECT 1 FROM shipments WHERE batch_id = ?", (batch_id,)).fetchone()
+            if ship is not None:
+                raise HTTPException(409, f"批次 {batch_id} 已发运，不能重复发运")
+            # 重查全部成员组当前是否有电芯被隔离（成员关系固定，直接按批次关联）
+            isolated = conn.execute(
+                "SELECT DISTINCT gc.group_id"
+                " FROM batch_groups bg"
+                " JOIN group_cells gc ON gc.group_id = bg.group_id"
+                " JOIN isolations i ON i.cell_id = gc.cell_id"
+                " WHERE bg.batch_id = ?"
+                " ORDER BY gc.group_id",
+                (batch_id,),
+            ).fetchall()
+            if isolated:
+                raise HTTPException(
+                    409,
+                    "批次成员当前被安全隔离，拒绝发运（未写发运记录）："
+                    + str([r["group_id"] for r in isolated]))
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO shipments (batch_id, shipped_at) VALUES (?, ?)",
+                (batch_id, now),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()  # 拒绝发运：不留下任何发运记录
+            raise
+    with db.read_snapshot(conn):
         return _batch_payload(conn, batch_id)

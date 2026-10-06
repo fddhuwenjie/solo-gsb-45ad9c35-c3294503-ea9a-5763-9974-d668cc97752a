@@ -1158,3 +1158,276 @@ def test_get_batch_reads_one_committed_snapshot(client):
 
     _assert_coherent_batch(outcome["batch"])
 
+
+# ---------- 发运 ----------
+
+def _make_batch(client, cell_groups=(("C001", "C002", "C003"), ("C004", "C005", "C006"))):
+    seed_six(client)
+    gids = [_make_group(client, list(ids)) for ids in cell_groups]
+    r = client.post("/batches", json={"group_ids": gids})
+    assert r.status_code == 201, r.text
+    return r.json()["batch_id"], gids
+
+
+def _assert_coherent_shipment_state(b):
+    """发运事实与当前隔离状态必须来自同一已提交快照。"""
+    assert b["shipped"] == (b["shipped_at"] is not None)
+    assert b["trace_required"] == (b["shipped"] and len(b["blocked_groups"]) > 0)
+
+
+def test_ship_batch_success(client):
+    bid, gids = _make_batch(client)
+    # 发运前：未发运批次继续按原规则查询，无发运事实
+    before = client.get(f"/batches/{bid}").json()
+    assert before["shipped"] is False
+    assert before["shipped_at"] is None
+    assert before["trace_required"] is False
+    assert before["deliverable"] is True
+
+    r = client.post(f"/batches/{bid}/ship")
+    assert r.status_code == 201, r.text
+    ship = r.json()
+    # 返回批次号、成员组号和各组原检测快照
+    assert ship["batch_id"] == bid
+    assert ship["shipped_at"]
+    assert ship["group_ids"] == gids
+    assert [g["group_id"] for g in ship["groups"]] == gids
+    for g in ship["groups"]:
+        assert g["cells"] == client.get(f"/groups/{g['group_id']}").json()["cells"]
+        assert g["blocked"] is False
+
+    # 批次查询呈现发运事实；成员未被隔离时不需追溯，其余口径不变
+    after = client.get(f"/batches/{bid}").json()
+    assert after["shipped"] is True
+    assert after["shipped_at"] == ship["shipped_at"]
+    assert after["trace_required"] is False
+    assert after["deliverable"] is True
+    assert after["group_ids"] == before["group_ids"]
+    assert [g["cells"] for g in after["groups"]] == [g["cells"] for g in before["groups"]]
+    lst = client.get("/batches").json()
+    assert lst["count"] == 1
+    assert lst["batches"][0]["shipped"] is True
+    assert lst["batches"][0]["shipped_at"] == ship["shipped_at"]
+    _assert_coherent_shipment_state(lst["batches"][0])
+
+
+def test_ship_missing_batch_404(client):
+    r = client.post("/batches/999/ship")
+    assert r.status_code == 404
+    assert "999" in r.json()["detail"]
+
+
+def test_repeat_ship_rejected_record_immutable(client):
+    bid, _ = _make_batch(client)
+    first = client.post(f"/batches/{bid}/ship")
+    assert first.status_code == 201
+    # 重复发运明确拒绝，不改写首次发运记录
+    again = client.post(f"/batches/{bid}/ship")
+    assert again.status_code == 409
+    assert "已发运" in again.json()["detail"]
+    b = client.get(f"/batches/{bid}").json()
+    assert b["shipped"] is True
+    assert b["shipped_at"] == first.json()["shipped_at"]
+
+
+def test_ship_blocked_batch_rejected_no_record(client):
+    bid, gids = _make_batch(client)
+    # 建批后隔离成员电芯 -> 批次当前被阻断，拒绝发运且不留发运记录
+    isolate(client, "C005", "巡检发现鼓包")
+    r = client.post(f"/batches/{bid}/ship")
+    assert r.status_code == 409
+    assert str(gids[1]) in r.json()["detail"]
+    assert "C005" in r.json()["detail"]
+    b = client.get(f"/batches/{bid}").json()
+    assert b["shipped"] is False
+    assert b["shipped_at"] is None
+    assert b["trace_required"] is False
+    assert b["deliverable"] is False
+
+
+def test_isolation_after_ship_trace_required_record_retained(client):
+    bid, gids = _make_batch(client)
+    ship = client.post(f"/batches/{bid}/ship")
+    assert ship.status_code == 201
+    before = client.get(f"/batches/{bid}").json()
+
+    # 发运先提交、隔离后到：发运记录保留，已发运批次显示需追溯
+    isolate(client, "C005", "巡检发现鼓包")
+    b = client.get(f"/batches/{bid}").json()
+    assert b["shipped"] is True
+    assert b["shipped_at"] == ship.json()["shipped_at"]
+    assert b["trace_required"] is True
+    assert b["deliverable"] is False
+    # 受影响的组号、电芯 ID 和原因可追溯
+    assert [(x["group_id"], x["cell_id"], x["reason"]) for x in b["blocked_groups"]] == [
+        (gids[1], "C005", "巡检发现鼓包")]
+    # 成员关系与各组原检测快照不改写
+    assert b["group_ids"] == before["group_ids"]
+    assert [g["cells"] for g in b["groups"]] == [g["cells"] for g in before["groups"]]
+    # 批次列表口径一致
+    lst = client.get("/batches").json()
+    assert lst["batches"][0]["shipped"] is True
+    assert lst["batches"][0]["trace_required"] is True
+    # 已发运批次不可再发运
+    assert client.post(f"/batches/{bid}/ship").status_code == 409
+
+
+def test_shipment_record_immutable_triggers(client):
+    bid, _ = _make_batch(client)
+    assert client.post(f"/batches/{bid}/ship").status_code == 201
+    import sqlite3
+    from app import db
+    conn = db.get_conn()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE shipments SET shipped_at = '2099-01-01' WHERE batch_id = ?", (bid,))
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM shipments WHERE batch_id = ?", (bid,))
+    conn.rollback()
+    # 触发器拦截后原记录保持不变
+    assert client.get(f"/batches/{bid}").json()["shipped"] is True
+
+
+def test_uncommitted_shipment_invisible_to_other_requests(client):
+    """发运事务未提交时，其他请求看不到发运事实；提交后一次性可见。"""
+    bid, _ = _make_batch(client)
+    from app import db
+    conn = db.get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO shipments (batch_id, shipped_at)"
+        " VALUES (?, '2026-10-06T01:00:00+00:00')", (bid,))
+    # 未提交：批次列表 / 按号查询都看不到发运事实
+    assert client.get(f"/batches/{bid}").json()["shipped"] is False
+    assert client.get("/batches").json()["batches"][0]["shipped"] is False
+    # 提交后：发运事实一次性可见
+    conn.commit()
+    b = client.get(f"/batches/{bid}").json()
+    assert b["shipped"] is True
+    assert b["shipped_at"] == "2026-10-06T01:00:00+00:00"
+
+
+def test_rolled_back_shipment_leaves_no_trace(client):
+    """发运回滚后毫无痕迹，批次仍可正常发运。"""
+    bid, _ = _make_batch(client)
+    from app import db
+    conn = db.get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO shipments (batch_id, shipped_at)"
+        " VALUES (?, '2026-10-06T01:00:00+00:00')", (bid,))
+    conn.rollback()
+    assert client.get(f"/batches/{bid}").json()["shipped"] is False
+    r = client.post(f"/batches/{bid}/ship")
+    assert r.status_code == 201
+    assert client.get(f"/batches/{bid}").json()["shipped"] is True
+
+
+def test_ship_and_isolation_race_commit_order_decides(client):
+    """发运与隔离并发：以提交先后决定是拒绝发运还是保留记录并转为需追溯。"""
+    bid, gids = _make_batch(client)
+    from app.main import app
+    results = {}
+    broken = []
+
+    def do_ship():
+        with TestClient(app) as c:
+            results["ship"] = c.post(f"/batches/{bid}/ship").status_code
+
+    def do_isolate():
+        with TestClient(app) as c:
+            results["isolate"] = c.post(
+                "/cells/C001/isolate", json={"reason": "并发隔离"}).status_code
+            for _ in range(10):
+                # 任何可见的批次都必须发运事实与隔离状态自洽
+                for b in c.get("/batches").json()["batches"]:
+                    try:
+                        _assert_coherent_batch(b)
+                        _assert_coherent_shipment_state(b)
+                    except AssertionError:
+                        broken.append(b)
+
+    threads = [threading.Thread(target=do_ship), threading.Thread(target=do_isolate)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not broken
+    assert results["isolate"] == 201  # 隔离本身总是成功
+    b = client.get(f"/batches/{bid}").json()
+    if results["ship"] == 201:
+        # 发运先提交：记录保留，随后的隔离使已发运批次显示需追溯
+        assert b["shipped"] is True
+        assert b["trace_required"] is True
+        assert [(x["group_id"], x["cell_id"]) for x in b["blocked_groups"]] == [
+            (gids[0], "C001")]
+    else:
+        # 隔离先提交：发运被拒绝，不留发运记录
+        assert results["ship"] == 409
+        assert b["shipped"] is False
+        assert b["shipped_at"] is None
+        assert b["trace_required"] is False
+        assert b["deliverable"] is False
+
+
+def _commit_shipment_then_isolation(path, batch_id, target):
+    """写方线程：在独立连接上先提交发运记录，再提交对 target 的隔离。
+    复现"发运先提交、隔离后提交"两次提交落在同一读请求窗口内。"""
+    import sqlite3
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO shipments (batch_id, shipped_at)"
+        " VALUES (?, '2026-10-06T01:00:00+00:00')", (batch_id,))
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO isolations (cell_id, reason, created_at)"
+        " VALUES (?, ?, '2026-10-06T02:00:00+00:00')", (target, "发运后隔离"))
+    conn.commit()
+    conn.close()
+
+
+def test_get_batch_shipment_reads_one_committed_snapshot(client):
+    """GET /batches/{batch_id}：发运事实与当前隔离状态取自同一已提交快照。
+
+    交错：读请求读到组阻断信息（尚未发运、尚未隔离）后挂起；写方先提交发运、
+    再提交对成员电芯的隔离；读请求随后才汇总阻断并读发运记录。合法结果只有
+    发运前 / 发运后隔离前 / 隔离后三种完整状态；绝不允许拼出 shipped=false
+    却 deliverable=false（发运先于隔离提交，该组合从未作为已提交状态存在）。
+    """
+    bid, _ = _make_batch(client)
+    from app import db
+    from app.main import get_batch
+    path = os.environ["DB_PATH"]
+
+    gate = {"inside": threading.Event(), "release": threading.Event()}
+    outcome = {}
+
+    def reader():
+        conn = db.get_conn()
+        _install_isolation_reader_gate(conn, gate, occurrence=1)
+        try:
+            outcome["batch"] = get_batch(bid)
+        finally:
+            conn.set_trace_callback(None)
+            conn.set_progress_handler(None, 0)
+
+    rt = threading.Thread(target=reader)
+    rt.start()
+    assert gate["inside"].wait(5)
+    _commit_shipment_then_isolation(path, bid, "C001")
+    gate["release"].set()
+    rt.join(5)
+    assert not rt.is_alive()
+
+    b = outcome["batch"]
+    _assert_coherent_batch(b)
+    _assert_coherent_shipment_state(b)
+    if not b["shipped"]:
+        # 发运前的快照里不可能看到发运后才提交的隔离
+        assert b["deliverable"] is True
+        assert b["blocked_groups"] == []
+

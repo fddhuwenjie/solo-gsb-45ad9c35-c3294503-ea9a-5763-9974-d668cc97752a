@@ -1,7 +1,7 @@
 """SQLite 存储层：每线程独立连接（WAL 模式）+ 写锁。
 
-- 写路径（录入 / 复测 / 确认 / 隔离 / 建批）在 write_lock 内以 BEGIN IMMEDIATE
-  开启单事务，保证整组占用与快照写入、整批归属登记的原子性；
+- 写路径（录入 / 复测 / 确认 / 隔离 / 建批 / 发运）在 write_lock 内以 BEGIN IMMEDIATE
+  开启单事务，保证整组占用与快照写入、整批归属登记、发运记录的原子性；
 - 每个请求线程使用自己的连接，读请求因此只能看到**已提交**的数据：
   确认事务中途写入的组记录、检测快照与临时占用对其他请求不可见，
   提交成功的瞬间整组一次性可见，回滚的确认对外不留任何痕迹；
@@ -90,6 +90,17 @@ CREATE TRIGGER IF NOT EXISTS trg_batch_groups_no_update BEFORE UPDATE ON batch_g
 BEGIN SELECT RAISE(ABORT, 'batch membership is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_batch_groups_no_delete BEFORE DELETE ON batch_groups
 BEGIN SELECT RAISE(ABORT, 'batch membership is immutable'); END;
+
+-- 发运记录：每批次最多一条（主键兜底），发运时间与批次关联一旦写入不可改写
+CREATE TABLE IF NOT EXISTS shipments (
+    batch_id   INTEGER PRIMARY KEY REFERENCES batches(batch_id),
+    shipped_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_shipments_no_update BEFORE UPDATE ON shipments
+BEGIN SELECT RAISE(ABORT, 'shipments are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_shipments_no_delete BEFORE DELETE ON shipments
+BEGIN SELECT RAISE(ABORT, 'shipments are immutable'); END;
 """
 
 # 确认/写入路径上的互斥锁，配合 BEGIN IMMEDIATE 保证事务原子性
